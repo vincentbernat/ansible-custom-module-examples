@@ -137,7 +137,7 @@ def main():
             *options[irr],
             "-i", "mnt-by",
             module.params['mntner']]
-    proc = subprocess.run("whois", *args, capture_output=True)
+    proc = subprocess.run(["whois", *args], capture_output=True)
     if proc.returncode != 0:
         raise AnsibleError(
             f"unable to query whois: {args}")
