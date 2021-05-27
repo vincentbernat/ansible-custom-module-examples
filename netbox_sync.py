@@ -24,6 +24,7 @@ import copy
 import pynetbox
 import attr
 import re
+from packaging import version
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ansible.module_utils.basic import AnsibleModule
@@ -56,13 +57,22 @@ class Synchronizer(object):
     only_on_create = ()        # list of attributes to only use when creating
     remove_unused = None       # remove not managed anymore (max to remove)
 
+    cache = None
+
     def wanted(self):
         """Extract from source of truth the set of wanted elements."""
         raise NotImplementedError()
 
-    def get(self, endpoint, key):
-        """Get current record from NetBox."""
-        return endpoint.get(**{self.key: key})
+    def get(self, ep, key):
+        """Get current record from Netbox."""
+        if self.cache is None:
+            self.cache = {}
+            for element in ep.filter(tag=["cmdb"]):
+                self.cache[element[self.key]] = element
+        try:
+            return self.cache[key]
+        except KeyError:
+            return ep.get(**{self.key: key})
 
     def prepare(self):
         """Prepare for synchronization by looking what's currently in NetBox
@@ -74,22 +84,25 @@ class Synchronizer(object):
         ep = getattr(getattr(self.netbox, self.app), self.table)
         self.before[self.table] = {}
         self.after[self.table] = {}
-        self.cache = {}
 
         # Check what should be added
         wanted = self.wanted()
 
         def process(key, details):
             current = self.get(ep, key)
-            self.cache[key] = current
             if current is not None:
                 current = {k: v for k, v in dict(current).items()
                            if k in ('id',) + tuple(details.keys())}
                 # When an attribute is a choice, use the value
                 for attrib in current:
                     if type(current[attrib]) is dict and \
-                       set(current[attrib].keys()) == {"id", "label", "value"}:
+                       set(current[attrib].keys()) in ({"id", "label", "value"},
+                                                       {"label", "value"}):
                         current[attrib] = current[attrib]["value"]
+                if "tags" in current and current["tags"]:
+                    if type(current["tags"][0]) is dict:
+                        current["tags"] = [c["name"] for c in current["tags"]]
+                    current["tags"].sort()
                 # Before/after takes the current value
                 self.before[self.table][key] = dict(current)
                 self.after[self.table][key] = copy.deepcopy(dict(current))
@@ -97,14 +110,32 @@ class Synchronizer(object):
                 for attrib in details:
                     if attrib in self.only_on_create:
                         continue
+                    if attrib == "tags":
+                        # Tags could be merged here. We choose not to
+                        # because it's difficult to delete our own
+                        # tags.
+                        if "cmdb" not in details["tags"]:
+                            details["tags"].append("cmdb")
+                        details["tags"].sort()
                     self.after[self.table][key][attrib] = details[attrib]
                 # Link foreign keys for "before"
                 for fkey, fclass in self.foreign.items():
                     old = self.before[self.table][key][fkey]
                     if old is None:
                         continue
-                    self.before[self.table][key][fkey] = old[fclass.key]
-
+                    if fclass.key in old:
+                        self.before[self.table][key][fkey] = old[fclass.key]
+                    else:
+                        # We do not have fclass.key directly here,
+                        # let's search by ID!
+                        id = old["id"]
+                        for k, v in self.before[fclass.table].items():
+                            if id == v["id"]:
+                                self.before[self.table][key][fkey] = k
+                                break
+                        else:
+                            raise RuntimeError("unable to find foreign key "
+                                               f"{fkey} for {k}")
                 # Is there a diff?
                 for attrib in self.after[self.table][key]:
                     if attrib not in self.before[self.table][key] or \
@@ -125,12 +156,11 @@ class Synchronizer(object):
 
         # Check what should be removed
         if not self.remove_unused or \
+           not self.module.params['cleanup'] or \
            not self.before["tags"]:
             return changed
-        existings = ep.filter(tag=["cmdb"])
         unused = 0
-        for existing in existings:
-            key = getattr(existing, self.key)
+        for key, existing in self.cache.items():
             if key not in self.before[self.table]:
                 changed = True
                 unused += 1
@@ -143,6 +173,18 @@ class Synchronizer(object):
 
         return changed
 
+    def _normalize_tags(self, tags):
+        """Normalize tags as a list of string with Netbox <= 2.8 or a list of
+        dicts with more recent versions. The provided list is expected
+        to contain strings and dicts but dicts may only be present
+        because fetched through the API (internally, we should use
+        strings only).
+        """
+        if version.parse(self.netbox.version) <= version.parse('2.8'):
+            return tags
+        return [{"name": t} if type(t) is str else t
+                for t in tags]
+
     def synchronize(self):
         """After preparation, synchronize the changes in NetBox. Currently,
         only do a one-way synchronization."""
@@ -154,7 +196,9 @@ class Synchronizer(object):
                     if attrib in self.foreign:
                         details[attrib] = self.after[
                             self.foreign[attrib].table][details[attrib]]["id"]
-                details["tags"] = ["cmdb"]
+                # New objects may not have tags
+                details["tags"] = self._normalize_tags(list(set(
+                    details.get("tags", [])).union({"cmdb"})))
                 result = ep.create(**{self.key: key}, **details)
                 details["id"] = result.id
             else:
@@ -167,12 +211,13 @@ class Synchronizer(object):
                         diff = True
                         break
                 if diff:
-                    current = self.cache[key]
-                    if hasattr(current, "tags") and "cmdb" not in current.tags:
-                        current.tags.append("cmdb")
+                    current = self.get(ep, key)
                     for attrib in details:
                         if attrib == "id":
                             continue
+                        if attrib == "tags":
+                            details["tags"] = self._normalize_tags(
+                                details["tags"])
                         if attrib not in self.foreign:
                             setattr(current, attrib, details[attrib])
                         else:
@@ -207,10 +252,15 @@ class SyncTags(Synchronizer):
     key = "name"
 
     def wanted(self):
-        return {"cmdb": dict(
-            slug="cmdb",
-            color="8bc34a",
-            description="synced by network CMDB")}
+        result = {"cmdb": dict(slug="cmdb",
+                               color="8bc34a",
+                               description="synced by network CMDB")}
+        result.update({tag: dict(slug=tag,
+                                 color="9e9e9e",
+                                 description="synced by network CMDB")
+                       for details in self.source['ips']
+                       for tag in details.get("tags", [])})
+        return result
 
 
 class SyncTenants(Synchronizer):
@@ -274,6 +324,7 @@ class SyncDeviceRoles(Synchronizer):
     app = "dcim"
     table = "device_roles"
     key = "name"
+    only_on_create = ("slug")
 
     def wanted(self):
         result = set(details["role"]
@@ -310,19 +361,33 @@ class SyncIPs(Synchronizer):
     foreign = {"tenant": SyncTenants}
     remove_unused = 1000
 
-    def get(self, endpoint, key):
-        """Grab IP address from NetBox."""
+    def get(self, ep, key):
+        """Grab IP address from Netbox."""
+        if self.cache is None:
+            self.cache = {}
+            for element in ep.filter(tag=["cmdb"]):
+                # Current element if it exists is overriden. We do not
+                # really handle the case where multiple addresses have
+                # the cmdb tag.
+                self.cache[element["address"]] = element
+
+        try:
+            return self.cache[key]
+        except KeyError:
+            pass
+
         # There may be duplicate. We need to grab the "best".
-        results = endpoint.filter(**{self.key: key})
+        results = ep.filter(**{self.key: key})
+        results = [r for r in results]
         if len(results) == 0:
             return None
-        if len(results) == 1:
-            return results[0]
         scores = [0]*len(results)
         for idx, result in enumerate(results):
-            if "cmdb" in result.tags:
+            if "cmdb" in [str(r) for r in result.tags]:
                 scores[idx] += 10
-            if result.interface is not None:
+            if getattr(result, "interface", None) is not None:
+                scores[idx] += 5
+            if getattr(result, "assigned_object", None) is not None:
                 scores[idx] += 5
         return sorted(zip(scores, results),
                       reverse=True, key=lambda k: k[0])[0][1]
@@ -339,6 +404,7 @@ class SyncIPs(Synchronizer):
                     status="active",
                     dns_name="",        # information is present in DNS
                     description=f"{details['device']}: {details['interface']}",
+                    tags=details.get('tags', []),
                     role=None,
                     vrf=None)
         return wanted
@@ -349,6 +415,7 @@ def main():
         source=dict(type='path', required=True),
         api=dict(type='str', required=True),
         token=dict(type='str', required=True, no_log=True),
+        cleanup=dict(type='bool', required=False, default=True),
         max_workers=dict(type='int', required=False, default=10)
     )
 
